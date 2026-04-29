@@ -36,6 +36,41 @@ if "_nutrition_cache_cleared" not in st.session_state:
 
 COMMON_ALLERGENS = ["milk", "peanuts", "wheat", "soy", "egg", "nuts"]
 
+# Added sugars are calculated only from added sweetener ingredients, not from
+# naturally occurring sugars in milk, fruits, nuts, or flours.
+ADDED_SUGAR_SOURCES = {
+    "sugar",
+    "jaggery",
+    "honey",
+    "glucose",
+    "dextrose",
+    "corn syrup",
+    "invert sugar",
+}
+
+# FSSAI allergen detection: partial-match ingredient names against this map and
+# return unique declaration labels.
+ALLERGEN_MAP = {
+    "milk": "Milk",
+    "whey": "Milk",
+    "casein": "Milk",
+    "ghee": "Milk",
+    "almonds": "Tree Nuts (Almonds)",
+    "almond": "Tree Nuts (Almonds)",
+    "cashew": "Tree Nuts (Cashew)",
+    "walnut": "Tree Nuts (Walnut)",
+    "pistachio": "Tree Nuts (Pistachio)",
+    "peanut": "Peanuts",
+    "soy": "Soy",
+    "soya": "Soy",
+    "wheat": "Gluten (Wheat)",
+    "maida": "Gluten (Wheat)",
+    "barley": "Gluten (Barley)",
+    "egg": "Egg",
+    "gram flour": "Chickpea",
+    "besan": "Chickpea",
+}
+
 SVG_VEG_SYMBOL = """<svg width="18" height="18" xmlns="http://www.w3.org/2000/svg">
   <rect x="1" y="1" width="16" height="16" fill="none" stroke="#008000" stroke-width="2"/>
   <circle cx="9" cy="9" r="5" fill="#008000"/>
@@ -559,10 +594,44 @@ def _nutrient_value(row, *keys):
     return 0.0
 
 
-def calculate_nutrition():
-    """Calculate nutrition from selected ingredients list.
+def _norm_ingredient_key(name):
+    return " ".join(str(name or "").strip().lower().split())
 
-    Custom ingredients contribute 0 nutrition.
+
+def _lookup_nutrition_row(key):
+    key = _norm_ingredient_key(key)
+    return VERIFIED_DB.get(key) or INGREDIENT_DB.get(key) or {}
+
+
+def _is_added_sugar_source(key):
+    key = _norm_ingredient_key(key)
+    return any(src == key or src in key for src in ADDED_SUGAR_SOURCES)
+
+
+def sort_ingredients_for_label(ingredients_list):
+    """Sort ingredients by percentage descending, then alphabetically for ties."""
+    cleaned = []
+    for ing in ingredients_list:
+        try:
+            pct = float(ing.get("percentage", ing.get("pct", 0)) or 0)
+        except (TypeError, ValueError):
+            pct = 0.0
+        if pct <= 0:
+            continue
+        name = str(ing.get("name", "")).strip()
+        key = _norm_ingredient_key(ing.get("key") or name)
+        if not name:
+            name = _display_name_from_key(key)
+        cleaned.append({**ing, "name": name, "key": key, "percentage": pct})
+    return sorted(cleaned, key=lambda x: (-float(x["percentage"]), x["name"].lower()))
+
+
+def calculate_nutrition_for_ingredients(ingredients_list):
+    """Calculate FSSAI nutrients per 100g final product.
+
+    FIX: Added Sugars is calculated only from added sweetener sources
+    (sugar, jaggery, honey, glucose, dextrose, corn syrup, invert sugar), not
+    natural sugars from milk, nuts, flours, fruits, etc.
     """
     total_nutrition = {
         "calories": 0.0,
@@ -570,28 +639,55 @@ def calculate_nutrition():
         "carbs": 0.0,
         "fat": 0.0,
         "sugar": 0.0,
+        "added_sugars": 0.0,
         "sodium": 0.0,
         "saturated_fat": 0.0,
         "trans_fat": 0.0,
     }
-    for ing in st.session_state.get("ingredients_list", []):
+    missing = []
+    for ing in ingredients_list:
         try:
-            pct = float(ing.get("percentage", 0)) / 100.0
+            pct_raw = float(ing.get("percentage", ing.get("pct", 0)) or 0)
         except (TypeError, ValueError):
-            pct = 0.0
-        if pct <= 0:
+            pct_raw = 0.0
+        if pct_raw <= 0:
             continue
-        if ing.get("is_verified") and ing.get("key") in VERIFIED_DB:
-            db_data = VERIFIED_DB[ing["key"]]
-            total_nutrition["calories"] += _nutrient_value(db_data, "calories", "energy") * pct
-            total_nutrition["protein"] += _nutrient_value(db_data, "protein") * pct
-            total_nutrition["carbs"] += _nutrient_value(db_data, "carbs", "carbohydrates") * pct
-            total_nutrition["fat"] += _nutrient_value(db_data, "fat", "total_fat") * pct
-            total_nutrition["sugar"] += _nutrient_value(db_data, "sugar", "total_sugars") * pct
-            total_nutrition["sodium"] += _nutrient_value(db_data, "sodium") * pct
-            total_nutrition["saturated_fat"] += _nutrient_value(db_data, "saturated_fat") * pct
-            total_nutrition["trans_fat"] += _nutrient_value(db_data, "trans_fat") * pct
-    return total_nutrition
+        pct = pct_raw / 100.0
+        name = str(ing.get("name", "")).strip()
+        key = _norm_ingredient_key(ing.get("key") or name)
+        db_data = _lookup_nutrition_row(key)
+        if not db_data:
+            missing.append(name or key)
+            continue
+
+        energy = _nutrient_value(db_data, "calories", "energy")
+        protein = _nutrient_value(db_data, "protein")
+        carbs = _nutrient_value(db_data, "carbs", "carbohydrates")
+        fat = _nutrient_value(db_data, "fat", "total_fat")
+        sugars = _nutrient_value(db_data, "sugar", "total_sugars")
+
+        total_nutrition["calories"] += energy * pct
+        total_nutrition["protein"] += protein * pct
+        total_nutrition["carbs"] += carbs * pct
+        total_nutrition["fat"] += fat * pct
+        total_nutrition["sugar"] += sugars * pct
+        # FIX: Added sugar contribution only from declared sweetener sources.
+        if _is_added_sugar_source(key):
+            total_nutrition["added_sugars"] += sugars * pct
+        total_nutrition["sodium"] += _nutrient_value(db_data, "sodium") * pct
+        total_nutrition["saturated_fat"] += _nutrient_value(db_data, "saturated_fat") * pct
+        total_nutrition["trans_fat"] += _nutrient_value(db_data, "trans_fat") * pct
+
+    rounded = {k: round(v, 2) for k, v in total_nutrition.items()}
+    return rounded, sorted(set(missing))
+
+
+def calculate_nutrition():
+    """Calculate nutrition from selected ingredients list."""
+    totals, _missing = calculate_nutrition_for_ingredients(
+        st.session_state.get("ingredients_list", [])
+    )
+    return totals
 
 
 def calculate_nutrition_from_ingredients(ingredient_rows):
@@ -841,14 +937,14 @@ def render_nutrient_warnings(
 
 
 def detect_allergens(ingredients_list):
-    detected = []
-    for allergen in COMMON_ALLERGENS:
-        allergen_singular = allergen[:-1] if allergen.endswith("s") else allergen
-        if any(allergen in ingredient or allergen_singular in ingredient for ingredient in ingredients_list):
-            detected.append(allergen)
-    if "peanuts" in detected and "nuts" in detected:
-        detected.remove("nuts")
-    return detected
+    # FIX: Use explicit FSSAI allergen mapping, including tree nuts and chickpea.
+    detected = set()
+    for ingredient in ingredients_list:
+        ing = _norm_ingredient_key(ingredient)
+        for needle, label in ALLERGEN_MAP.items():
+            if needle in ing:
+                detected.add(label)
+    return sorted(detected)
 
 
 def format_quantity_display(quantity_text):
@@ -2756,10 +2852,10 @@ if True:
             st.rerun()
 
         st.markdown("---")
-        if abs(total_percentage - 100) < 0.01:
+        if abs(total_percentage - 100) <= 0.1:
             st.success(f"✓ Total: {total_percentage:.1f}% - Perfect!")
         else:
-            st.error(f"⚠ Total: {total_percentage:.1f}% - Must equal 100%")
+            st.error(f"⚠ Total: {total_percentage:.1f}% - Total must be 100%")
 
         custom_items = [ing for ing in st.session_state.ingredients_list if not ing.get("is_verified")]
         if custom_items:
@@ -2836,27 +2932,36 @@ if generate_label:
 
     if not ingredient_rows:
         st.error("Add at least one ingredient with a valid percentage.")
-    elif abs(total_percentage - 100.0) > 0.01:
-        st.error(
-            f"Ingredient percentages must total 100%. Current total: {total_percentage:.2f}%"
-        )
+    elif abs(total_percentage - 100.0) > 0.1:
+        st.error("Total must be 100%")
+        st.caption(f"Current total: {total_percentage:.2f}%")
     else:
         cleaned_ingredients = [
             (r.get("ingredient_lower") or r.get("ingredient", "").lower())
             for r in ingredient_rows
         ]
-        ingredients = ", ".join(ingredients_for_label)
+        sorted_ingredients = sort_ingredients_for_label(st.session_state.ingredients_list)
+        ingredients = ", ".join(ing["name"] for ing in sorted_ingredients)
         detected_allergens = detect_allergens(cleaned_ingredients)
-        nutrition_totals = calculate_nutrition()
+        nutrition_totals, missing_nutrition = calculate_nutrition_for_ingredients(
+            st.session_state.ingredients_list
+        )
         total_calories = round(float(nutrition_totals.get("calories", 0)), 2)
         total_protein = round(float(nutrition_totals.get("protein", 0)), 2)
         total_carbs = round(float(nutrition_totals.get("carbs", 0)), 2)
         total_sugar = round(float(nutrition_totals.get("sugar", 0)), 2)
+        total_added_sugars = round(float(nutrition_totals.get("added_sugars", 0)), 2)
         total_fat = round(float(nutrition_totals.get("fat", 0)), 2)
         total_saturated_fat = round(float(nutrition_totals.get("saturated_fat", 0)), 2)
         total_trans_fat = round(float(nutrition_totals.get("trans_fat", 0)), 2)
         total_sodium = round(float(nutrition_totals.get("sodium", 0)), 2)
-        nutrition_fallback = list(custom_ingredients)
+        nutrition_fallback = sorted(set(list(custom_ingredients) + missing_nutrition))
+        if missing_nutrition:
+            st.warning(
+                "Missing nutrition data for: "
+                + ", ".join(missing_nutrition[:8])
+                + ("..." if len(missing_nutrition) > 8 else "")
+            )
         custom_ingredients = sorted(set(custom_ingredients))
         if custom_ingredients:
             st.warning(
@@ -2916,6 +3021,7 @@ if generate_label:
             "total_saturated_fat": total_saturated_fat,
             "total_trans_fat": total_trans_fat,
             "total_sodium": total_sodium,
+            "total_added_sugars": total_added_sugars,
             "nutrition_fallback": nutrition_fallback,
             "is_vegetarian": food_type == "Vegetarian",
             "quantity": net_qty_value,
@@ -2949,6 +3055,7 @@ if st.session_state.label_data:
     total_protein = label_data.get("total_protein", 0)
     total_carbs = label_data.get("total_carbs", 0)
     total_sugar = label_data.get("total_sugar", 0)
+    total_added_sugars = label_data.get("total_added_sugars", 0)
     total_fat = label_data.get("total_fat", 0)
     total_saturated_fat = label_data.get("total_saturated_fat", 0)
     total_trans_fat = label_data.get("total_trans_fat", 0)
@@ -2988,7 +3095,7 @@ if st.session_state.label_data:
         "saturated_fat": total_saturated_fat,
         "trans_fat": total_trans_fat,
         "sodium": total_sodium,
-        "added_sugars": 0,
+        "added_sugars": total_added_sugars,
         "quantity": quantity,
         "license_no": license_no,
         "manufacture_date": manufacture_date,
@@ -3031,7 +3138,7 @@ if st.session_state.label_data:
     )
     if nutrition_fallback:
         st.caption(
-            "Used default estimate (no DB / AI match) for: "
+            "Missing/custom nutrition data (0 used for custom items) for: "
             + ", ".join(nutrition_fallback)
         )
 
@@ -3165,6 +3272,7 @@ if st.session_state.label_data:
             saturated_fat=total_saturated_fat,
             trans_fat=total_trans_fat,
             sodium=total_sodium,
+            added_sugars=total_added_sugars,
             quantity=quantity,
             license_no=license_no,
             manufacture_date=manufacture_date,
